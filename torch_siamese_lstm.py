@@ -2,6 +2,7 @@
 import argparse
 import logging
 import torch
+import io
 
 from random import shuffle
 from typing import NamedTuple
@@ -22,8 +23,9 @@ def parse_cli_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train", "-t", required=True)
     parser.add_argument("--test", "-e", required=True)
+    parser.add_argument("--output", "-o", required=False)
     parser.add_argument("--batch-size", "-b", type=int, default=128)
-    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--epochs", type=int, default=5)
     return parser.parse_args()
 
 
@@ -142,11 +144,16 @@ class SiameseLSTM(nn.Module):
         return self.forward(*sampled_batch[:-1]).to(torch.float32)
 
 
-def train_model(model: SiameseLSTM, n_epochs, train_data_loader, eval_data_loader,
-                val_steps=5):
+def train_model(
+        model: SiameseLSTM,
+        n_epochs: int,
+        train_data_loader: DataLoader,
+        eval_data_loader: DataLoader,
+        val_steps: int = 500
+):
     logger.info(f"Training Siamese LSTM")
     model.train()
-    loss_fn = nn.BCELoss()
+    loss_fn = nn.BCELoss(reduction='sum')
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
     for epi in range(n_epochs):
@@ -165,19 +172,22 @@ def train_model(model: SiameseLSTM, n_epochs, train_data_loader, eval_data_loade
 
             if i_batch % val_steps == 0 and i_batch > 0:
                 acc, p, r, f1 = evaluate_model(model, eval_data_loader)
-                for n in [acc, p, r, f1]:
-                    print(type(n))
                 logger.info(f"Epoch {epi}, batch {i_batch}, "
                             f"loss = {cum_loss / samples:.4f}, "
-                            f"validation accuracy = {100 * acc:.2f}%, "
-                            f"precision = {p:.2f}, "
-                            f"recall = {r:.2f}, "
-                            f"f1 = {f1:.2f}")
+                            f"validation accuracy = {acc:.3f}, "
+                            f"precision = {p:.3f}, "
+                            f"recall = {r:.3f}, "
+                            f"f1 = {f1:.3f}")
                 cum_loss, samples = 0.0, 0
+
+        acc, p, r, f1 = evaluate_model(model, eval_data_loader)
+        logger.info(f"Validation metrics after epoch {epi}: "
+                    f"acc = {acc:.3f}, p = {p:.3f}, r = {r:.3f}, f1 = {f1:.3f}")
+
+    return acc, p, r, f1
 
 
 def evaluate_model(model: SiameseLSTM, data_loader: DataLoader):
-    logger.info(f"Evaluating model")
     y_true, y_pred = [], []
     for sampled_batch in data_loader:
         labels = sampled_batch[-1].to(torch.float32)
@@ -222,7 +232,22 @@ def main():
     slstm = SiameseLSTM(len(vocab), vocab.PAD_IDX)
 
     # Train the model
-    train_model(slstm, args.epochs, data_loaders[0], data_loaders[1])
+    val_metrics = train_model(slstm, args.epochs, data_loaders[0], data_loaders[1])
+
+    # Evaluate the model on the held out test set
+    logger.info("Evaluating final model")
+    acc, p, r, f1 = evaluate_model(slstm, data_loaders[2])
+    logger.info(f"Final model test metrics: acc = {acc:.3f}, p = {p:.3f}, r = {r:.3f}, f1 = {f1:.3f}")
+
+    if args.output:
+        torch.save(slstm.state_dict(), args.output)
+        with io.open(f"{args.output}.results", "w", encoding="utf-8") as fout:
+            for (setn, metrics) in [("Validation", val_metrics), ("Test", (acc, p, r, f1))]:
+                fout.write(f"### {setn} metrics ###\n")
+                fout.write(f"accuracy = {100 * metrics[0]:.2f}%\n")
+                fout.write(f"p = {metrics[1]:.3f}\n")
+                fout.write(f"r = {metrics[2]:.3f}\n")
+                fout.write(f"f1 = {metrics[3]:.3f}\n")
 
 
 if __name__ == "__main__":
